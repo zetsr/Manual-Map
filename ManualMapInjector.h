@@ -18,6 +18,7 @@ namespace ManualMapInjector {
     using TULONGLONG = ULONGLONG;
     const WORD TARGET_MACHINE = IMAGE_FILE_MACHINE_AMD64;
 #define IMAGE_REL_BASED_SELF_ARCH IMAGE_REL_BASED_DIR64
+#define TULONGLONG_FORMAT "0x%llX"
 #else
     using IMAGE_NT_HEADERS_CURRENT = IMAGE_NT_HEADERS32;
     using PIMAGE_NT_HEADERS_CURRENT = PIMAGE_NT_HEADERS32;
@@ -25,6 +26,7 @@ namespace ManualMapInjector {
     using TULONGLONG = DWORD;
     const WORD TARGET_MACHINE = IMAGE_FILE_MACHINE_I386;
 #define IMAGE_REL_BASED_SELF_ARCH IMAGE_REL_BASED_HIGHLOW
+#define TULONGLONG_FORMAT "0x%X"
 #endif
 
     // --- Shellcode 函数指针类型定义 ---
@@ -66,13 +68,29 @@ namespace ManualMapInjector {
 
             while ((LPBYTE)pImportDesc < importDirEnd &&
                 (pImportDesc->Name != 0 || pImportDesc->OriginalFirstThunk != 0 || pImportDesc->FirstThunk != 0)) {
+
+                if (pImportDesc->Name == 0) {
+                    pImportDesc++;
+                    continue;
+                }
+
                 char* dllName = (char*)((LPBYTE)imageBase + pImportDesc->Name);
                 HMODULE hMod = pLoadLibraryA(dllName);
                 if (!hMod) return (DWORD)-5;
 
-                PIMAGE_THUNK_DATA pThunkILT = (pImportDesc->OriginalFirstThunk == 0) ?
-                    (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + pImportDesc->FirstThunk) :
-                    (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + pImportDesc->OriginalFirstThunk);
+                // 确定使用哪个thunk（INT或IAT）
+                PIMAGE_THUNK_DATA pThunkILT = nullptr;
+                if (pImportDesc->OriginalFirstThunk != 0) {
+                    pThunkILT = (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + pImportDesc->OriginalFirstThunk);
+                }
+                else if (pImportDesc->FirstThunk != 0) {
+                    pThunkILT = (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + pImportDesc->FirstThunk);
+                }
+                else {
+                    pImportDesc++;
+                    continue;
+                }
+
                 PIMAGE_THUNK_DATA pThunkIAT = (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + pImportDesc->FirstThunk);
 
                 while (pThunkILT->u1.AddressOfData != 0) {
@@ -103,11 +121,43 @@ namespace ManualMapInjector {
         DWORD entryPointRVA = pNtHeaders->OptionalHeader.AddressOfEntryPoint;
         if (entryPointRVA != 0) {
             DllEntryProc dllMain = (DllEntryProc)((LPBYTE)imageBase + entryPointRVA);
+            // 注意：某些DLL可能不期望被手动映射，DllMain可能返回FALSE
             BOOL success = dllMain((HINSTANCE)imageBase, DLL_PROCESS_ATTACH, NULL);
             return (DWORD)success;
         }
         return (DWORD)1;
     }
+
+    // 计算函数大小
+#pragma optimize("", off)
+    template<typename T>
+    size_t GetFunctionSize(T* function) {
+        uint8_t* ptr = (uint8_t*)function;
+        while (true) {
+            // 寻找函数结束模式 (RET指令)
+#if defined(_WIN64)
+            if (ptr[0] == 0xC3 || ptr[0] == 0xC2)
+#else
+            if (ptr[0] == 0xC3 || ptr[0] == 0xC2 || ptr[0] == 0xC9 || ptr[0] == 0xCA)
+#endif
+            {
+                // 确保不是内联数据
+                bool isFunctionEnd = true;
+                for (int i = 1; i < 8; i++) {
+                    if (ptr[i] == 0xCC) break; // 典型的函数填充模式
+                    if (ptr[i] != 0x00 && ptr[i] != 0x90) { // NOP或NULL
+                        isFunctionEnd = false;
+                        break;
+                    }
+                }
+                if (isFunctionEnd) {
+                    return (ptr - (uint8_t*)function) + 1;
+                }
+            }
+            ptr++;
+        }
+    }
+#pragma optimize("", on)
 
     // --- 辅助结构和类型 ---
     struct HandleDeleter {
@@ -119,14 +169,26 @@ namespace ManualMapInjector {
 
     using unique_handle = std::unique_ptr<void, HandleDeleter>;
 
+    // 虚拟内存释放器
+    struct VirtualFreeDeleter {
+        HANDLE hProcess;
+        VirtualFreeDeleter(HANDLE process) : hProcess(process) {}
+
+        void operator()(LPVOID memory) const {
+            if (memory) VirtualFreeEx(hProcess, memory, 0, MEM_RELEASE);
+        }
+    };
+
+    using unique_virtual_mem = std::unique_ptr<void, VirtualFreeDeleter>;
+
     // --- 实用函数 ---
 
-    // 将 std::wstring 转换为 std::string
-    std::string WstringToString(const std::wstring& wstr) {
+    // 将 std::wstring 转换为 std::string (UTF-8)
+    std::string WstringToUtf8(const std::wstring& wstr) {
         if (wstr.empty()) return "";
-        int size = WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
+        int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
         std::string str(size, 0);
-        WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), -1, &str[0], size, NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &str[0], size, NULL, NULL);
         str.resize(size - 1);
         return str;
     }
@@ -157,17 +219,23 @@ namespace ManualMapInjector {
             return NULL;
         }
 
-        std::string moduleNameAnsi = WstringToString(moduleName);
-        HMODULE hInjectorMod = LoadLibraryA(moduleNameAnsi.c_str());
+        std::string moduleNameUtf8 = WstringToUtf8(moduleName);
+        HMODULE hInjectorMod = GetModuleHandleA(moduleNameUtf8.c_str());
         if (!hInjectorMod) {
-            wprintf(L"错误：LoadLibraryA 失败，模块 '%s'。错误代码：%lu\n", moduleName.c_str(), GetLastError());
-            return NULL;
+            hInjectorMod = LoadLibraryA(moduleNameUtf8.c_str());
+            if (!hInjectorMod) {
+                wprintf(L"错误：LoadLibraryA 失败，模块 '%s'。错误代码：%lu\n", moduleName.c_str(), GetLastError());
+                return NULL;
+            }
         }
-        unique_handle injectorModHandle(hInjectorMod);
+
+        // 注意：我们不会释放hInjectorMod，因为如果是通过GetModuleHandle获取的，不应该释放
+        // 如果是通过LoadLibrary加载的，这是一个小的内存泄漏，但考虑到使用场景，可以接受
 
         FARPROC injectorFuncAddr = GetProcAddress(hInjectorMod, procName.c_str());
         if (!injectorFuncAddr) {
-            wprintf(L"错误：GetProcAddress 失败，函数 '%S' 在模块 '%s' 中。错误代码：%lu\n", procName.c_str(), moduleName.c_str(), GetLastError());
+            wprintf(L"错误：GetProcAddress 失败，函数 '%hs' 在模块 '%s' 中。错误代码：%lu\n",
+                procName.c_str(), moduleName.c_str(), GetLastError());
             return NULL;
         }
 
@@ -240,8 +308,8 @@ namespace ManualMapInjector {
 
         if (!allocatedBase) {
             DWORD preferredAllocError = GetLastError();
-            wprintf(L"警告：首选基址分配失败于 0x%p。错误代码：%lu。尝试在任意位置分配...\n",
-                (void*)pNtHeaders->OptionalHeader.ImageBase, preferredAllocError);
+            wprintf(L"警告：首选基址分配失败于 " TULONGLONG_FORMAT "。错误代码：%lu。尝试在任意位置分配...\n",
+                (TULONGLONG)pNtHeaders->OptionalHeader.ImageBase, preferredAllocError);
 
             allocatedBase = VirtualAllocEx(processHandle.get(), NULL, pNtHeaders->OptionalHeader.SizeOfImage,
                 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -251,21 +319,24 @@ namespace ManualMapInjector {
                 return false;
             }
         }
-        wprintf(L"为 DLL 镜像分配内存于：0x%p\n", allocatedBase);
+
+        // 使用RAII包装分配的内存
+        VirtualFreeDeleter deleter(processHandle.get());
+        unique_virtual_mem allocatedBaseWrapper(allocatedBase, deleter);
+
+        wprintf(L"为 DLL 镜像分配内存于： " TULONGLONG_FORMAT "\n", (TULONGLONG)allocatedBase);
 
         // 写入 PE 头
         SIZE_T bytesWritten;
         DWORD sizeOfHeaders = pNtHeaders->OptionalHeader.SizeOfHeaders;
         if (sizeOfHeaders > fileSize) {
             wprintf(L"错误：SizeOfHeaders 大于缓冲区大小。\n");
-            VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
             return false;
         }
 
         if (!WriteProcessMemory(processHandle.get(), allocatedBase, dllBuffer, sizeOfHeaders, &bytesWritten) ||
             bytesWritten != sizeOfHeaders) {
             wprintf(L"错误：WriteProcessMemory（头）失败。错误代码：%lu\n", GetLastError());
-            VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
             return false;
         }
         wprintf(L"PE 头已写入目标进程。\n");
@@ -277,13 +348,11 @@ namespace ManualMapInjector {
                 (pSectionHeader->PointerToRawData > fileSize ||
                     pSectionHeader->PointerToRawData + pSectionHeader->SizeOfRawData > fileSize)) {
                 wprintf(L"错误：节 %d 原始数据超出范围。\n", i);
-                VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
                 return false;
             }
 
             if (static_cast<TULONGLONG>(pSectionHeader->VirtualAddress) + pSectionHeader->Misc.VirtualSize > pNtHeaders->OptionalHeader.SizeOfImage) {
                 wprintf(L"错误：节 %d 虚拟地址超出分配内存范围。\n", i);
-                VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
                 return false;
             }
 
@@ -294,7 +363,6 @@ namespace ManualMapInjector {
                     pSectionHeader->SizeOfRawData, &bytesWritten) ||
                     bytesWritten != pSectionHeader->SizeOfRawData) {
                     wprintf(L"错误：WriteProcessMemory（节 %d）失败。错误代码：%lu\n", i, GetLastError());
-                    VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
                     return false;
                 }
             }
@@ -304,7 +372,8 @@ namespace ManualMapInjector {
         // 处理重定位
         TULONGLONG delta = (TULONGLONG)((LPBYTE)allocatedBase - pNtHeaders->OptionalHeader.ImageBase);
         if (delta != 0) {
-            wprintf(L"需要重定位。偏移量：0x%llX\n", delta);
+            wprintf(L"需要重定位。偏移量：" TULONGLONG_FORMAT "\n", delta);
+
             IMAGE_DATA_DIRECTORY relocDir = pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
 
             if (relocDir.VirtualAddress == 0 || relocDir.Size == 0) {
@@ -314,7 +383,6 @@ namespace ManualMapInjector {
                 DWORD relocOffset = RvaToFileOffset(pNtHeaders, relocDir.VirtualAddress, fileSize);
                 if (relocOffset == 0 || relocOffset + relocDir.Size > fileSize) {
                     wprintf(L"错误：重定位目录超出范围。\n");
-                    VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
                     return false;
                 }
 
@@ -324,7 +392,6 @@ namespace ManualMapInjector {
                 while ((LPBYTE)pRelocBlock < relocTableEnd && pRelocBlock->SizeOfBlock > 0) {
                     if ((LPBYTE)pRelocBlock + pRelocBlock->SizeOfBlock > relocTableEnd) {
                         wprintf(L"错误：无效的重定位块大小。\n");
-                        VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
                         return false;
                     }
 
@@ -335,23 +402,27 @@ namespace ManualMapInjector {
                         WORD type = (*pRelocEntry >> 12);
                         WORD offset = (*pRelocEntry & 0xFFF);
 
+                        // 跳过类型0（填充）
+                        if (type == 0) continue;
+
                         if (type == IMAGE_REL_BASED_SELF_ARCH) {
                             LPVOID patchAddrTarget = (LPBYTE)allocatedBase + pRelocBlock->VirtualAddress + offset;
                             TULONGLONG originalAddr;
                             SIZE_T bytesRead;
                             if (!ReadProcessMemory(processHandle.get(), patchAddrTarget, &originalAddr, sizeof(TULONGLONG), &bytesRead) ||
                                 bytesRead != sizeof(TULONGLONG)) {
-                                wprintf(L"警告：ReadProcessMemory 在 0x%p 失败。\n", patchAddrTarget);
+                                wprintf(L"警告：ReadProcessMemory 在 " TULONGLONG_FORMAT " 失败。\n", (TULONGLONG)patchAddrTarget);
                                 continue;
                             }
 
                             TULONGLONG newAddr = originalAddr + delta;
                             if (!WriteProcessMemory(processHandle.get(), patchAddrTarget, &newAddr, sizeof(TULONGLONG), &bytesWritten) ||
                                 bytesWritten != sizeof(TULONGLONG)) {
-                                wprintf(L"警告：WriteProcessMemory（重定位）在 0x%p 失败。\n", patchAddrTarget);
+                                wprintf(L"警告：WriteProcessMemory（重定位）在 " TULONGLONG_FORMAT " 失败。\n", (TULONGLONG)patchAddrTarget);
                                 continue;
                             }
                         }
+                        // 可以在这里添加对其他重定位类型的支持
                     }
                     pRelocBlock = (PIMAGE_BASE_RELOCATION)((LPBYTE)pRelocBlock + pRelocBlock->SizeOfBlock);
                 }
@@ -368,16 +439,15 @@ namespace ManualMapInjector {
 
         if (!pLoadLibraryA_Remote || !pGetProcAddress_Remote) {
             wprintf(L"错误：无法找到 LoadLibraryA 或 GetProcAddress。\n");
-            VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
             return false;
         }
 
         LPVOID shellcodeDataMem = VirtualAllocEx(processHandle.get(), NULL, sizeof(ShellcodeData), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if (!shellcodeDataMem) {
             wprintf(L"错误：VirtualAllocEx（ShellcodeData）失败。错误代码：%lu\n", GetLastError());
-            VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
             return false;
         }
+        unique_virtual_mem shellcodeDataWrapper(shellcodeDataMem, deleter);
 
         ShellcodeData data;
         data.InjectedDllBase = allocatedBase;
@@ -388,25 +458,22 @@ namespace ManualMapInjector {
 
         if (!WriteProcessMemory(processHandle.get(), shellcodeDataMem, &data, sizeof(ShellcodeData), &bytesWritten) || bytesWritten != sizeof(ShellcodeData)) {
             wprintf(L"错误：WriteProcessMemory（ShellcodeData）失败。错误代码：%lu\n", GetLastError());
-            VirtualFreeEx(processHandle.get(), shellcodeDataMem, 0, MEM_RELEASE);
-            VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
             return false;
         }
 
-        SIZE_T shellcodeSize = 4096;
+        // 动态计算Shellcode大小
+        SIZE_T shellcodeSize = GetFunctionSize(Shellcode);
+        wprintf(L"Shellcode 大小: %zu 字节\n", shellcodeSize);
+
         LPVOID shellcodeMem = VirtualAllocEx(processHandle.get(), NULL, shellcodeSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!shellcodeMem) {
             wprintf(L"错误：VirtualAllocEx（shellcode）失败。错误代码：%lu\n", GetLastError());
-            VirtualFreeEx(processHandle.get(), shellcodeDataMem, 0, MEM_RELEASE);
-            VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
             return false;
         }
+        unique_virtual_mem shellcodeWrapper(shellcodeMem, deleter);
 
         if (!WriteProcessMemory(processHandle.get(), shellcodeMem, (LPVOID)Shellcode, shellcodeSize, &bytesWritten) || bytesWritten != shellcodeSize) {
             wprintf(L"错误：WriteProcessMemory（shellcode）失败。错误代码：%lu\n", GetLastError());
-            VirtualFreeEx(processHandle.get(), shellcodeMem, 0, MEM_RELEASE);
-            VirtualFreeEx(processHandle.get(), shellcodeDataMem, 0, MEM_RELEASE);
-            VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
             return false;
         }
 
@@ -418,9 +485,6 @@ namespace ManualMapInjector {
         unique_handle threadHandle(CreateRemoteThread(processHandle.get(), NULL, 0, (LPTHREAD_START_ROUTINE)shellcodeMem, shellcodeDataMem, 0, NULL));
         if (!threadHandle.get()) {
             wprintf(L"错误：CreateRemoteThread 失败。错误代码：%lu\n", GetLastError());
-            VirtualFreeEx(processHandle.get(), shellcodeMem, 0, MEM_RELEASE);
-            VirtualFreeEx(processHandle.get(), shellcodeDataMem, 0, MEM_RELEASE);
-            VirtualFreeEx(processHandle.get(), allocatedBase, 0, MEM_RELEASE);
             return false;
         }
 
@@ -442,8 +506,11 @@ namespace ManualMapInjector {
             else if (exitCode != (DWORD)TRUE) wprintf(L"注意：Shellcode 返回退出代码 (%lu)。\n", exitCode);
         }
 
-        VirtualFreeEx(processHandle.get(), shellcodeMem, 0, MEM_RELEASE);
-        VirtualFreeEx(processHandle.get(), shellcodeDataMem, 0, MEM_RELEASE);
+        // 释放包装器所有权，让RAII对象在函数结束时自动清理
+        allocatedBaseWrapper.release();
+        shellcodeDataWrapper.release();
+        shellcodeWrapper.release();
+
         wprintf(L"注入完成。\n");
         return true;
     }

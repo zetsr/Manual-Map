@@ -1,6 +1,7 @@
 ﻿#include <vector>
 #include <string>
 #include <algorithm>
+#include <cmath>
 #define NOMINMAX // Prevents conflicts with min/max macros in windows.h
 #include <windows.h>
 #include <tlhelp32.h> // For process listing
@@ -15,35 +16,57 @@
 #include <thread>     // For std::this_thread::sleep_for
 #include <chrono>     // For std::chrono::milliseconds
 #include <conio.h>    // For _getwch
-
+#include <iomanip>    // For std::setw, std::setfill
 
 // Assume ManualMapInjector.h contains the definition of the ManualMapInjector class
 // and the static ManualMapInject method used below.
 /*
 #ifndef MANUALMAPINJECTOR_H
 #define MANUALMAPINJECTOR_H
-
 #include <windows.h>
 #include <cstdint>
-
 class ManualMapInjector {
 public:
     static bool ManualMapInject(DWORD pid, BYTE* dllBuffer, size_t dllSize);
-
 #ifdef _WIN64
     static const WORD TARGET_MACHINE = IMAGE_FILE_MACHINE_AMD64; // Compiled as 64-bit
 #else
     static const WORD TARGET_MACHINE = IMAGE_FILE_MACHINE_I386; // Compiled as 32-bit
 #endif
 };
-
 #endif // MANUALMAPINJECTOR_H
 */
 #include "ManualMapInjector.h" // Include your ManualMapInjector.h file
 
 #pragma comment(lib, "wininet.lib")
 
+// --- RAII Wrappers for WinINet handles ---
+struct InternetHandleDeleter {
+    void operator()(HINTERNET handle) const {
+        if (handle != NULL) {
+            InternetCloseHandle(handle);
+        }
+    }
+};
+using unique_internet_handle = std::unique_ptr<void, InternetHandleDeleter>;
+
 // --- Console Utility ---
+// Hides or shows the console cursor
+void SetConsoleCursorVisibility(bool visible) {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hConsole == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    CONSOLE_CURSOR_INFO cursorInfo;
+    if (!GetConsoleCursorInfo(hConsole, &cursorInfo)) {
+        return;
+    }
+
+    cursorInfo.bVisible = visible;
+    SetConsoleCursorInfo(hConsole, &cursorInfo);
+}
+
 // Clears the console screen using Windows API
 void ClearConsole() {
     HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -74,7 +97,6 @@ void ClearConsole() {
     // Move the cursor to the top-left corner
     SetConsoleCursorPosition(hConsole, cursorHome);
 }
-
 
 // --- Custom Output Function ---
 // Encapsulates output to add a consistent prefix and use wide characters
@@ -132,7 +154,6 @@ void DisplayBanner() {
     PrintMessage(L""); // Add a newline
 }
 
-
 // --- Helper Structures and Types ---
 
 // Represents basic information about a running process
@@ -157,6 +178,125 @@ struct CommandLineArgs {
     std::wstring processName;
     std::wstring dllUrl;
     bool forceWaitProcessStart = false;
+};
+
+// --- Progress Bar Implementation ---
+class WgetStyleProgressBar {
+private:
+    size_t total_size;
+    size_t downloaded;
+    std::chrono::steady_clock::time_point start_time;
+    int last_progress_percent;
+    int console_width;
+
+    std::wstring FormatSize(size_t bytes) {
+        const wchar_t* units[] = { L"B", L"KB", L"MB", L"GB" };
+        int unit_index = 0;
+        double size = static_cast<double>(bytes);
+
+        while (size >= 1024.0 && unit_index < 3) {
+            size /= 1024.0;
+            unit_index++;
+        }
+
+        std::wstringstream ss;
+        ss << std::fixed << std::setprecision(1) << size << L" " << units[unit_index];
+        return ss.str();
+    }
+
+    std::wstring FormatTime(double seconds) {
+        int hours = static_cast<int>(seconds) / 3600;
+        int minutes = (static_cast<int>(seconds) % 3600) / 60;
+        int secs = static_cast<int>(seconds) % 60;
+
+        std::wstringstream ss;
+        if (hours > 0) {
+            ss << hours << L":" << std::setw(2) << std::setfill(L'0') << minutes
+                << L":" << std::setw(2) << std::setfill(L'0') << secs;
+        }
+        else {
+            ss << minutes << L":" << std::setw(2) << std::setfill(L'0') << secs;
+        }
+        return ss.str();
+    }
+
+    void GetConsoleWidth() {
+        CONSOLE_SCREEN_BUFFER_INFO csbi;
+        if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+            console_width = csbi.dwSize.X;
+        }
+        else {
+            console_width = 80; // Default width
+        }
+    }
+
+public:
+    WgetStyleProgressBar(size_t total) : total_size(total), downloaded(0),
+        last_progress_percent(-1), console_width(80) {
+        start_time = std::chrono::steady_clock::now();
+        GetConsoleWidth();
+    }
+
+    void Update(size_t new_downloaded) {
+        downloaded = new_downloaded;
+
+        if (total_size == 0) {
+            // Unknown total size - show indeterminate progress
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+            double speed = (elapsed > 0) ? static_cast<double>(downloaded) / elapsed : 0;
+
+            std::wcout << L"\r" << FormatSize(downloaded) << L" ["
+                << std::setw(5) << std::setprecision(1) << std::fixed
+                << speed << L"B/s]";
+            std::wcout.flush();
+            return;
+        }
+
+        int percent = static_cast<int>((static_cast<double>(downloaded) / total_size) * 100);
+        if (percent == last_progress_percent && percent < 100) {
+            return; // Don't update if percentage hasn't changed
+        }
+        last_progress_percent = percent;
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+        double speed = (elapsed > 0) ? static_cast<double>(downloaded) / elapsed : 0;
+
+        // Calculate ETA
+        double eta_seconds = (speed > 0) ? (total_size - downloaded) / speed : 0;
+
+        // Create progress bar
+        int bar_width = std::max(20, console_width - 50);
+        int completed_width = static_cast<int>((static_cast<double>(bar_width) * percent) / 100);
+
+        std::wstringstream progress_bar;
+        progress_bar << L"[";
+        for (int i = 0; i < bar_width; i++) {
+            if (i < completed_width) {
+                progress_bar << L"=";
+            }
+            else if (i == completed_width) {
+                progress_bar << L">";
+            }
+            else {
+                progress_bar << L" ";
+            }
+        }
+        progress_bar << L"]";
+
+        std::wcout << L"\r" << std::setw(3) << percent << L"% " << progress_bar.str()
+            << L" " << FormatSize(downloaded) << L" " << FormatSize(static_cast<size_t>(speed)) << L"/s"
+            << L" eta " << FormatTime(eta_seconds);
+        std::wcout.flush();
+    }
+
+    void Finish() {
+        if (total_size > 0) {
+            Update(total_size); // Ensure we show 100%
+        }
+        std::wcout << std::endl;
+    }
 };
 
 // --- Core Utility Functions ---
@@ -343,7 +483,7 @@ DWORD FindTargetProcess(const std::wstring& processName, bool forceWait) {
             if (pid == 0) {
                 // Use carriage return \r to overwrite the waiting message on the same line
                 std::wcout << L"> 未找到目标进程 " << processName << L"，正在等待...   \r" << std::flush;
-                std::this_thread::sleep_for(std::chrono::seconds(2)); // Wait before trying again
+                std::this_thread::sleep_for(std::chrono::nanoseconds(0)); // Wait before trying again
             }
         }
         // After finding, print a final newline to clear the "Waiting..." line and print success
@@ -368,31 +508,27 @@ DWORD FindTargetProcess(const std::wstring& processName, bool forceWait) {
     return pid; // Returns 0 if not found (and not waiting), or the PID
 }
 
-
 // Gets the size of a file from a HTTP/HTTPS URL
 // Uses separate InternetOpen/Url/Close handles as it's a distinct step
 bool GetHttpFileSize(const std::wstring& url, size_t& fileSize) {
     fileSize = 0;
-    HINTERNET hInternet = NULL;
-    HINTERNET hUrl = NULL;
 
-    hInternet = InternetOpenW(L"DLLDownloader", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    unique_internet_handle hInternet(InternetOpenW(L"DLLDownloader", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0));
     if (!hInternet) {
         PrintMessage(L"错误：[GetSize] InternetOpenW 失败。错误代码：" + std::to_wstring(GetLastError()));
         return false;
     }
 
-    hUrl = InternetOpenUrlW(hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE, 0);
+    unique_internet_handle hUrl(InternetOpenUrlW(hInternet.get(), url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE, 0));
     if (!hUrl) {
         PrintMessage(L"错误：[GetSize] InternetOpenUrlW 失败。无法打开 URL：" + url + L"。错误代码：" + std::to_wstring(GetLastError()));
-        InternetCloseHandle(hInternet);
         return false;
     }
 
     DWORD contentLength = 0;
     DWORD length = sizeof(contentLength);
     // Query for Content-Length header
-    if (!HttpQueryInfoW(hUrl, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &contentLength, &length, NULL)) {
+    if (!HttpQueryInfoW(hUrl.get(), HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER, &contentLength, &length, NULL)) {
         DWORD lastError = GetLastError();
         if (lastError == ERROR_HTTP_HEADER_NOT_FOUND) {
             PrintMessage(L"警告：[GetSize] 无法获取 Content-Length 头部。下载将继续，但无法预知文件大小。");
@@ -400,8 +536,6 @@ bool GetHttpFileSize(const std::wstring& url, size_t& fileSize) {
         }
         else {
             PrintMessage(L"错误：[GetSize] HttpQueryInfoW 失败。无法获取 Content-Length。错误代码：" + std::to_wstring(lastError));
-            InternetCloseHandle(hUrl);
-            InternetCloseHandle(hInternet);
             return false; // Critical error if not just header not found
         }
     }
@@ -415,196 +549,131 @@ bool GetHttpFileSize(const std::wstring& url, size_t& fileSize) {
         }
     }
 
-    InternetCloseHandle(hUrl);
-    InternetCloseHandle(hInternet);
     return true; // Return true even if size is 0 or unknown (warning issued)
 }
 
 // Downloads the DLL from a URL into a memory buffer
-// This version avoids 'goto' to resolve initialization-skipping errors.
 std::unique_ptr<BYTE[]> DownloadDLLToMemory(const std::wstring& url, size_t& outSize) {
     outSize = 0;
     size_t fileSize = 0;
-
-    // Declare all variables at the top, initialized to safe defaults
-    HINTERNET hInternet = NULL;
-    HINTERNET hUrl = NULL;
-    LPVOID buffer = NULL; // Intermediate buffer for download
-    std::unique_ptr<BYTE[]> dllBuffer = nullptr; // Final buffer to return
-    size_t totalRead = 0;
-    size_t bufferSize = 0;
-    BYTE* currentPos = NULL;
-
-    PrintMessage(L"正在从 " + url + L" 下载 DLL...");
 
     // Attempt to get file size first, but proceed even if unknown
     // GetHttpFileSize handles its own InternetOpen/Url/Close handles
     bool sizeKnown = GetHttpFileSize(url, fileSize);
 
-    // --- Resource Acquisition Steps ---
-
-    hInternet = InternetOpenW(L"DLLDownloader", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    unique_internet_handle hInternet(InternetOpenW(L"DLLDownloader", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0));
     if (!hInternet) {
         PrintMessage(L"错误：InternetOpenW 失败。无法初始化网络连接。错误代码：" + std::to_wstring(GetLastError()));
-        return nullptr; // Indicate failure
+        return nullptr;
     }
 
-    hUrl = InternetOpenUrlW(hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE, 0);
+    unique_internet_handle hUrl(InternetOpenUrlW(hInternet.get(), url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE, 0));
     if (!hUrl) {
         PrintMessage(L"错误：InternetOpenUrlW 失败。无法打开 URL：" + url + L"。错误代码：" + std::to_wstring(GetLastError()));
-        InternetCloseHandle(hInternet); // Cleanup acquired resource
-        return nullptr; // Indicate failure
+        return nullptr;
     }
 
+    // Create progress bar
+    WgetStyleProgressBar progressBar(fileSize);
+    PrintMessage(L"正在从 " + url + L" 下载 DLL...");
+
     // Calculate initial buffer size
-    bufferSize = sizeKnown && fileSize > 0 ? fileSize + std::max<size_t>(fileSize / 10, 1024 * 1024) : 10 * 1024 * 1024; // 10MB initial buffer if size unknown
+    size_t bufferSize = sizeKnown && fileSize > 0 ?
+        fileSize + std::max<size_t>(fileSize / 10, 1024 * 1024) :
+        10 * 1024 * 1024; // 10MB initial buffer if size unknown
+
     // Ensure a minimum buffer size even if estimated size is tiny or 0
     if (bufferSize < 4096) bufferSize = 4096;
 
-
     // Allocate initial buffer
-    buffer = VirtualAlloc(NULL, bufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    std::unique_ptr<BYTE[]> buffer(new (std::nothrow) BYTE[bufferSize]);
     if (!buffer) {
-        PrintMessage(L"错误：VirtualAlloc 失败。无法分配下载缓冲区（" + std::to_wstring(bufferSize) + L" 字节）。可能由于内存不足或碎片化。错误代码：" + std::to_wstring(GetLastError()));
-        // Cleanup resources acquired before this point
-        InternetCloseHandle(hUrl);
-        InternetCloseHandle(hInternet);
-        return nullptr; // Indicate failure
+        PrintMessage(L"错误：内存分配失败。无法分配下载缓冲区（" + std::to_wstring(bufferSize) + L" 字节）。可能由于内存不足或碎片化。");
+        return nullptr;
     }
-    currentPos = static_cast<BYTE*>(buffer); // Set current position now that buffer is valid
 
-
-    // --- Download Loop ---
-
-    BYTE temp[4096]; // Read buffer
+    size_t totalRead = 0;
+    BYTE temp[8192]; // Increased read buffer size for better performance
     DWORD bytesRead;
 
-    while (InternetReadFile(hUrl, temp, sizeof(temp), &bytesRead) && bytesRead > 0) {
+    while (InternetReadFile(hUrl.get(), temp, sizeof(temp), &bytesRead) && bytesRead > 0) {
+        // Check if we need to resize buffer
         if (totalRead + bytesRead > bufferSize) {
-            // Buffer is too small, attempt to reallocate
-            size_t newBufferSize = bufferSize * 2; // Double the buffer size
-            // Prevent integer overflow on massive sizes, cap reallocation if needed
-            if (newBufferSize < bufferSize) { // Overflow check
-                PrintMessage(L"错误：尝试重新分配缓冲区时发生溢出。目标大小过大。");
-                // --- Failure during realloc: Need to cleanup everything acquired so far ---
-                VirtualFree(buffer, 0, MEM_RELEASE);
-                InternetCloseHandle(hUrl);
-                InternetCloseHandle(hInternet);
-                return nullptr; // Indicate failure
-            }
+            // Calculate new buffer size
+            size_t newBufferSize = bufferSize * 2;
+
             // Cap maximum buffer size to prevent excessive memory use
-            const size_t MAX_BUFFER_SIZE = 256 * 1024 * 1024; // Example: 256MB
-            if (newBufferSize > MAX_BUFFER_SIZE) newBufferSize = MAX_BUFFER_SIZE;
-            if (totalRead + bytesRead > newBufferSize) {
-                PrintMessage(L"错误：下载数据超出最大允许缓冲区大小 (" + std::to_wstring(MAX_BUFFER_SIZE) + L" 字节)。");
-                // --- Failure during realloc: Need to cleanup everything acquired so far ---
-                VirtualFree(buffer, 0, MEM_RELEASE);
-                InternetCloseHandle(hUrl);
-                InternetCloseHandle(hInternet);
-                return nullptr; // Indicate failure
+            const size_t MAX_BUFFER_SIZE = 256 * 1024 * 1024; // 256MB
+            if (newBufferSize > MAX_BUFFER_SIZE) {
+                if (totalRead + bytesRead > MAX_BUFFER_SIZE) {
+                    PrintMessage(L"错误：下载数据超出最大允许缓冲区大小 (" + std::to_wstring(MAX_BUFFER_SIZE) + L" 字节)。");
+                    return nullptr;
+                }
+                newBufferSize = MAX_BUFFER_SIZE;
             }
 
-
-            PrintMessage(L"警告：下载缓冲区不足，尝试重新分配到 " + std::to_wstring(newBufferSize) + L" 字节。");
-            LPVOID newBuffer = VirtualAlloc(NULL, newBufferSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            // Reallocate buffer
+            std::unique_ptr<BYTE[]> newBuffer(new (std::nothrow) BYTE[newBufferSize]);
             if (!newBuffer) {
-                PrintMessage(L"错误：VirtualAlloc 重新分配失败。无法扩展下载缓冲区。错误代码：" + std::to_wstring(GetLastError()));
-                // --- Failure during realloc: Need to cleanup everything acquired so far ---
-                VirtualFree(buffer, 0, MEM_RELEASE);
-                InternetCloseHandle(hUrl);
-                InternetCloseHandle(hInternet);
-                return nullptr; // Indicate failure
+                PrintMessage(L"错误：内存重新分配失败。无法扩展下载缓冲区。");
+                return nullptr;
             }
-            // Copy existing data to the new buffer
-            std::copy(static_cast<BYTE*>(buffer), static_cast<BYTE*>(buffer) + totalRead, static_cast<BYTE*>(newBuffer));
-            VirtualFree(buffer, 0, MEM_RELEASE); // Free the old buffer
-            buffer = newBuffer;
+
+            // Copy existing data
+            std::copy(buffer.get(), buffer.get() + totalRead, newBuffer.get());
+            buffer = std::move(newBuffer);
             bufferSize = newBufferSize;
-            // Update current position based on the new buffer address
-            currentPos = static_cast<BYTE*>(buffer) + totalRead;
+
+            PrintMessage(L"警告：下载缓冲区不足，尝试重新分配到 " + std::to_wstring(bufferSize) + L" 字节。");
         }
 
-        std::copy(temp, temp + bytesRead, currentPos);
-        currentPos += bytesRead;
+        // Copy new data to buffer
+        std::copy(temp, temp + bytesRead, buffer.get() + totalRead);
         totalRead += bytesRead;
-        // Optional: Print progress indicator
-        // Print every MB or at the end of read loop iteration
-        if (totalRead % (1024 * 1024) == 0 || bytesRead < sizeof(temp) || totalRead == bufferSize) {
-            std::wcout << L"> 已下载: " << totalRead / 1024 << L" KB\r" << std::flush;
-        }
-    }
-    std::wcout << std::endl; // Newline after progress indicator
 
-    // Check for errors after the loop completes or exits
+        // Update progress bar
+        progressBar.Update(totalRead);
+    }
+
+    // Check for download errors
     DWORD lastInternetError = GetLastError();
     if (totalRead == 0 && lastInternetError != ERROR_SUCCESS) {
-        // InternetReadFile failed and didn't read anything, and GetLastError indicates an error
         PrintMessage(L"错误：DLL 下载失败，未读取到任何数据。InternetReadFile 错误代码：" + std::to_wstring(lastInternetError));
-        // --- Failure after loop: Need to cleanup everything acquired so far ---
-        if (buffer) VirtualFree(buffer, 0, MEM_RELEASE); // Free intermediate buffer if allocated
-        if (hUrl) InternetCloseHandle(hUrl);
-        if (hInternet) InternetCloseHandle(hInternet);
-        return nullptr; // Indicate failure
+        return nullptr;
     }
     else if (totalRead == 0) {
-        // Downloaded 0 bytes, but InternetReadFile didn't report an error.
-        // This means the file content was actually empty.
         PrintMessage(L"警告：下载的 DLL 为空（0 字节）。");
-        // We'll proceed, but dllBuffer will remain nullptr.
-        // --- Cleanup intermediate resources ---
-        if (buffer) VirtualFree(buffer, 0, MEM_RELEASE);
-        if (hUrl) InternetCloseHandle(hUrl);
-        if (hInternet) InternetCloseHandle(hInternet);
-        return nullptr; // Return nullptr for an empty DLL
+        return nullptr;
     }
 
+    // Finalize progress bar
+    progressBar.Finish();
 
-    // --- Finalization (Success Path) ---
+    // Create final buffer with exact size
+    std::unique_ptr<BYTE[]> finalBuffer(new (std::nothrow) BYTE[totalRead]);
+    if (!finalBuffer) {
+        PrintMessage(L"错误：无法分配最终 DLL 缓冲区 (" + std::to_wstring(totalRead) + L" 字节)。可能由于内存不足。");
+        return nullptr;
+    }
 
+    // Copy data to final buffer
+    std::copy(buffer.get(), buffer.get() + totalRead, finalBuffer.get());
     outSize = totalRead;
-    // Only allocate final buffer if data was actually read (> 0 bytes)
-    if (outSize > 0) {
-        dllBuffer = std::make_unique<BYTE[]>(outSize);
-        // Check if allocation succeeded
-        if (!dllBuffer) {
-            PrintMessage(L"错误：无法分配最终 DLL 缓冲区 (" + std::to_wstring(outSize) + L" 字节)。可能由于内存不足。");
-            // --- Failure during final allocation: Cleanup intermediate resources ---
-            if (buffer) VirtualFree(buffer, 0, MEM_RELEASE);
-            if (hUrl) InternetCloseHandle(hUrl);
-            if (hInternet) InternetCloseHandle(hInternet);
-            return nullptr; // Indicate failure
-        }
-        std::copy(static_cast<BYTE*>(buffer), static_cast<BYTE*>(buffer) + outSize, dllBuffer.get());
-        // Message already printed in the successful > 0-byte case above
-    }
-    else {
-        // totalRead was 0, dllBuffer is already nullptr. Cleanup intermediate resources.
-        if (buffer) VirtualFree(buffer, 0, MEM_RELEASE);
-        if (hUrl) InternetCloseHandle(hUrl);
-        if (hInternet) InternetCloseHandle(hInternet);
-        return nullptr; // Explicitly return nullptr for 0-byte case
-    }
 
-
-    // --- Cleanup Intermediate Resources (Success Path before returning dllBuffer) ---
-    // These resources are no longer needed after copying data to dllBuffer
-    if (buffer) VirtualFree(buffer, 0, MEM_RELEASE); // Free the intermediate download buffer
-    if (hUrl) InternetCloseHandle(hUrl);
-    if (hInternet) InternetCloseHandle(hInternet);
-
-
-    return dllBuffer; // Returns the downloaded buffer unique_ptr or nullptr on failure/empty download
+    PrintMessage(L"DLL 成功下载到内存。大小：" + std::to_wstring(outSize) + L" 字节。");
+    return finalBuffer;
 }
-
 
 // --- Main Program ---
 
 int wmain(int argc, wchar_t* argv[]) {
     // Configure console for Unicode output and input (important for _getwch)
-    // Using _setmode is generally more reliable than SetConsoleOutputCP
     _setmode(_fileno(stdout), _O_U16TEXT);
     _setmode(_fileno(stderr), _O_U16TEXT);
     _setmode(_fileno(stdin), _O_U16TEXT);
+
+    // Hide console cursor permanently as requested
+    SetConsoleCursorVisibility(false);
 
     // Clear the console before displaying the banner
     ClearConsole();
@@ -629,11 +698,8 @@ int wmain(int argc, wchar_t* argv[]) {
     // Attempt to enable debug privilege
     if (!EnableDebugPrivilege()) {
         // Non-critical failure, warning is printed by the function
-        // If SeDebugPrivilege is required for OpenProcess and we couldn't get it,
-        // OpenProcess will fail later.
     }
     PrintMessage(L""); // Add a newline
-
 
     // Find the target process
     DWORD targetPID = FindTargetProcess(args.processName, args.forceWaitProcessStart);
@@ -648,39 +714,26 @@ int wmain(int argc, wchar_t* argv[]) {
 
     // Download the DLL
     size_t dllSize = 0;
-    // dllBuffer is a unique_ptr, memory will be freed automatically when it goes out of scope,
-    // UNLESS the caller explicitly takes ownership (not done here).
     auto dllBuffer = DownloadDLLToMemory(args.dllUrl, dllSize);
 
-    // Check if download was successful (buffer is not nullptr and size is > 0 for meaningful DLL)
+    // Check if download was successful
     if (!dllBuffer || dllSize == 0) {
         PrintMessage(L"错误：DLL 下载失败或文件为空。无法进行注入。");
-        // dllBuffer's unique_ptr will clean up if it's not null (which it won't be if size was 0 but buffer allocated)
-        // However, DownloadDLLToMemory is now designed to return nullptr for 0-byte or failed downloads,
-        // so the ptr is null here if there's an issue.
         PrintMessage(L"程序将退出。");
         PrintMessage(L"按任意键继续...");
         _getwch();
         return 1; // Exit with error code
     }
 
-    PrintMessage(L"DLL 成功下载到内存。大小：" + std::to_wstring(dllSize) + L" 字节。");
     PrintMessage(L""); // Add a newline
-
 
     // Execute the manual mapping injection
     PrintMessage(L"开始手动映射注入...");
-    // Call the static injection method from ManualMapInjector class
-    // Pass the raw pointer to the buffer data
     bool injectionSuccess = ManualMapInjector::ManualMapInject(targetPID, dllBuffer.get(), dllSize);
 
     // Securely zero the DLL buffer in memory regardless of injection success/failure
-    // This is important if the DLL contains sensitive data.
-    // Ensure dllBuffer is not null before attempting to zero memory.
-    if (dllBuffer) {
-        SecureZeroMemory(dllBuffer.get(), dllSize);
-        PrintMessage(L"DLL 内存缓冲区已安全擦除。");
-    }
+    SecureZeroMemory(dllBuffer.get(), dllSize);
+    PrintMessage(L"DLL 内存缓冲区已安全擦除。");
 
     if (injectionSuccess) {
         PrintMessage(L"手动映射注入成功！");

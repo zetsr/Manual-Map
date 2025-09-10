@@ -9,3 +9,7 @@
 ```bash
 Manual-Map.exe -process=<进程名.exe> -dll=<DLL URL> [-force_wait_process_start=<true|false>]
 ```
+示例
+```base
+Manual-Map.exe -process=cs2.exe -dll=https://example.com/cs2.dll -force_wait_process_start=true
+```

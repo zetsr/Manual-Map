@@ -5,15 +5,48 @@
       <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
       <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
     </Filter>
+    <Filter Include="API">
+      <UniqueIdentifier>{8703bd00-c6df-4ba5-8744-590288c58607}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Injector">
+      <UniqueIdentifier>{6c8679d0-ec07-40ab-a95f-5820e8cc345f}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="Manual-Map.cpp">
-      <Filter>源文件</Filter>
-    </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="ManualMapInjector.h">
-      <Filter>源文件</Filter>
+    <ClInclude Include="API\API.h">
+      <Filter>API</Filter>
     </ClInclude>
+    <ClInclude Include="API\Config.h">
+      <Filter>API</Filter>
+    </ClInclude>
+    <ClInclude Include="API\ManualMap.h">
+      <Filter>API</Filter>
+    </ClInclude>
+    <ClInclude Include="API\Shellcode.h">
+      <Filter>API</Filter>
+    </ClInclude>
+    <ClInclude Include="API\Util.h">
+      <Filter>API</Filter>
+    </ClInclude>
+    <ClInclude Include="Injector\Common.h">
+      <Filter>Injector</Filter>
+    </ClInclude>
+    <ClInclude Include="Injector\Console.h">
+      <Filter>Injector</Filter>
+    </ClInclude>
+    <ClInclude Include="Injector\Print.h">
+      <Filter>Injector</Filter>
+    </ClInclude>
+    <ClInclude Include="Injector\Http.h">
+      <Filter>Injector</Filter>
+    </ClInclude>
+    <ClInclude Include="API\ManualMapInjector.h">
+      <Filter>API</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Injector\Main.cpp">
+      <Filter>Injector</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

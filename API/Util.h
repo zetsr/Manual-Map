@@ -1,0 +1,142 @@
+#ifndef MM_UTIL_H
+#define MM_UTIL_H
+
+#include "Config.h"
+#include <tlhelp32.h>
+#include <memory>
+#include <string>
+#include <vector>
+#include <cstdint>
+#include <cstdio>
+
+namespace ManualMapInjector {
+
+    struct HandleDeleter {
+        using pointer = HANDLE;
+        void operator()(HANDLE handle) const {
+            if (handle != NULL && handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+        }
+    };
+    using unique_handle = std::unique_ptr<void, HandleDeleter>;
+
+    struct VirtualFreeDeleter {
+        HANDLE hProcess;
+        VirtualFreeDeleter(HANDLE process) : hProcess(process) {}
+        void operator()(LPVOID memory) const {
+            if (memory) VirtualFreeEx(hProcess, memory, 0, MEM_RELEASE);
+        }
+    };
+    using unique_virtual_mem = std::unique_ptr<void, VirtualFreeDeleter>;
+
+    inline std::string WstringToUtf8(const std::wstring& wstr) {
+        if (wstr.empty()) return "";
+        int size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
+        std::string str(size, 0);
+        WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &str[0], size, NULL, NULL);
+        str.resize(size - 1);
+        return str;
+    }
+
+    inline HMODULE GetModuleBaseInTargetProcess(HANDLE hProcess, const std::wstring& moduleName) {
+        HANDLE rawSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetProcessId(hProcess));
+        if (rawSnapshot == INVALID_HANDLE_VALUE) {
+            return NULL;
+        }
+        unique_handle snapshotHandle(rawSnapshot);
+
+        MODULEENTRY32 me32 = { sizeof(MODULEENTRY32) };
+        if (Module32First(snapshotHandle.get(), &me32)) {
+            do {
+                if (_wcsicmp(me32.szModule, moduleName.c_str()) == 0) {
+                    return (HMODULE)me32.modBaseAddr;
+                }
+            } while (Module32Next(snapshotHandle.get(), &me32));
+        }
+        return NULL;
+    }
+
+    inline FARPROC FindRemoteProcAddress(HANDLE hProcess, const std::wstring& moduleName, const std::string& procName) {
+        HMODULE hTargetMod = GetModuleBaseInTargetProcess(hProcess, moduleName);
+        if (!hTargetMod) {
+            wprintf(L"错误：模块 '%s' 在目标进程中未找到。\n", moduleName.c_str());
+            return NULL;
+        }
+
+        std::string moduleNameUtf8 = WstringToUtf8(moduleName);
+        HMODULE hInjectorMod = GetModuleHandleA(moduleNameUtf8.c_str());
+        bool loadedByUs = false;
+
+        if (!hInjectorMod) {
+            hInjectorMod = LoadLibraryA(moduleNameUtf8.c_str());
+            if (!hInjectorMod) {
+                wprintf(L"错误：LoadLibraryA 失败，模块 '%s'。错误代码：%lu\n", moduleName.c_str(), GetLastError());
+                return NULL;
+            }
+            loadedByUs = true;
+        }
+
+        FARPROC injectorFuncAddr = GetProcAddress(hInjectorMod, procName.c_str());
+        if (!injectorFuncAddr) {
+            wprintf(L"错误：GetProcAddress 失败，函数 '%hs' 在模块 '%s' 中。错误代码：%lu\n",
+                procName.c_str(), moduleName.c_str(), GetLastError());
+            if (loadedByUs) FreeLibrary(hInjectorMod);
+            return NULL;
+        }
+
+        TULONGLONG funcOffset = (TULONGLONG)injectorFuncAddr - (TULONGLONG)hInjectorMod;
+        FARPROC result = (FARPROC)((LPBYTE)hTargetMod + funcOffset);
+
+        if (loadedByUs) {
+            FreeLibrary(hInjectorMod);
+        }
+
+        return result;
+    }
+
+    inline DWORD RvaToFileOffset(PIMAGE_NT_HEADERS_CURRENT pNtHeaders, DWORD rva, size_t fileSize) {
+        if (rva < pNtHeaders->OptionalHeader.SizeOfHeaders) return rva;
+
+        PIMAGE_SECTION_HEADER pSectionHeader = IMAGE_FIRST_SECTION(pNtHeaders);
+        for (WORD i = 0; i < pNtHeaders->FileHeader.NumberOfSections; ++i, ++pSectionHeader) {
+            if (rva >= pSectionHeader->VirtualAddress && rva < pSectionHeader->VirtualAddress + pSectionHeader->Misc.VirtualSize) {
+                if (rva - pSectionHeader->VirtualAddress < pSectionHeader->SizeOfRawData) {
+                    DWORD offset = rva - pSectionHeader->VirtualAddress + pSectionHeader->PointerToRawData;
+                    if (offset < static_cast<DWORD>(fileSize)) return offset;
+                }
+                return 0;
+            }
+        }
+        return 0;
+    }
+
+#pragma optimize("", off)
+    template<typename T>
+    size_t GetFunctionSize(T* function) {
+        uint8_t* ptr = (uint8_t*)function;
+        while (true) {
+#if defined(_WIN64)
+            if (ptr[0] == 0xC3 || ptr[0] == 0xC2)
+#else
+            if (ptr[0] == 0xC3 || ptr[0] == 0xC2 || ptr[0] == 0xC9 || ptr[0] == 0xCA)
+#endif
+            {
+                bool isFunctionEnd = true;
+                for (int i = 1; i < 8; i++) {
+                    if (ptr[i] == 0xCC) break;
+                    if (ptr[i] != 0x00 && ptr[i] != 0x90) {
+                        isFunctionEnd = false;
+                        break;
+                    }
+                }
+                if (isFunctionEnd) {
+                    return (ptr - (uint8_t*)function) + 1;
+                }
+            }
+            ptr++;
+        }
+    }
+#pragma optimize("", on)
+
+}
+
+#endif

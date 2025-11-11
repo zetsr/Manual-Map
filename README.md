@@ -7,9 +7,10 @@
 通过以下命令行参数指定目标进程和 DLL：
 
 ```bash
-Manual-Map.exe -process=<进程名.exe> -dll=<DLL URL> [-force_wait_process_start=<true|false>]
+Manual-Map_x64.exe -process=<进程名.exe> -dll=<DLL URL> [-force_wait_process_start=<true|false>]
 ```
 示例
 ```base
-Manual-Map.exe -process=cs2.exe -dll=https://example.com/cs2.dll -force_wait_process_start=true
+Manual-Map_x64.exe -process=cs2.exe -dll=https://example.com/cs2.dll -force_wait_process_start=true
+Manual-Map_x86.exe -process=csgo.exe -dll=https://example.com/csgo.dll -force_wait_process_start=true
 ```

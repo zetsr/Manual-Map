@@ -29,21 +29,29 @@ namespace ManualMapInjector {
         DWORD importDirSize = data->ImportDirSize;
 
         PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)imageBase;
-        if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) return (DWORD)-2;
+        // 修复：跳过 DOS 签名验证（unlink 后无效，但已知注入内存 OK）
+        // if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) return (DWORD)-2;  // 注释掉
 
         PIMAGE_NT_HEADERS_CURRENT pNtHeaders = (PIMAGE_NT_HEADERS_CURRENT)((LPBYTE)imageBase + pDosHeader->e_lfanew);
         if (pNtHeaders->Signature != IMAGE_NT_SIGNATURE) return (DWORD)-3;
 
         if (!(pNtHeaders->FileHeader.Characteristics & IMAGE_FILE_DLL)) return (DWORD)-4;
 
+        DWORD imageSize = pNtHeaders->OptionalHeader.SizeOfImage;
+
+        // 导入表处理（保持安全检查）
         if (importDirRVA != 0 && importDirSize > 0) {
+            if (importDirRVA >= imageSize) return (DWORD)-7;
+
             PIMAGE_IMPORT_DESCRIPTOR pImportDesc = (PIMAGE_IMPORT_DESCRIPTOR)((LPBYTE)imageBase + importDirRVA);
             LPBYTE importDirEnd = (LPBYTE)pImportDesc + importDirSize;
 
-            while ((LPBYTE)pImportDesc < importDirEnd &&
-                (pImportDesc->Name != 0 || pImportDesc->OriginalFirstThunk != 0 || pImportDesc->FirstThunk != 0)) {
+            while ((LPBYTE)pImportDesc < importDirEnd) {
+                if (pImportDesc->Name == 0 && pImportDesc->OriginalFirstThunk == 0 && pImportDesc->FirstThunk == 0) {
+                    break;
+                }
 
-                if (pImportDesc->Name == 0) {
+                if (pImportDesc->Name == 0 || pImportDesc->Name >= imageSize) {
                     pImportDesc++;
                     continue;
                 }
@@ -52,28 +60,33 @@ namespace ManualMapInjector {
                 HMODULE hMod = pLoadLibraryA(dllName);
                 if (!hMod) return (DWORD)-5;
 
-                PIMAGE_THUNK_DATA pThunkILT = nullptr;
-                if (pImportDesc->OriginalFirstThunk != 0) {
-                    pThunkILT = (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + pImportDesc->OriginalFirstThunk);
-                }
-                else if (pImportDesc->FirstThunk != 0) {
-                    pThunkILT = (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + pImportDesc->FirstThunk);
-                }
-                else {
+                DWORD thunkRVA = pImportDesc->OriginalFirstThunk ? pImportDesc->OriginalFirstThunk : pImportDesc->FirstThunk;
+                if (thunkRVA == 0 || thunkRVA >= imageSize) {
                     pImportDesc++;
                     continue;
                 }
 
-                PIMAGE_THUNK_DATA pThunkIAT = (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + pImportDesc->FirstThunk);
+                PIMAGE_THUNK_DATA pThunkILT = (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + thunkRVA);
 
-                while (pThunkILT->u1.AddressOfData != 0) {
+                DWORD iatRVA = pImportDesc->FirstThunk;
+                if (iatRVA >= imageSize) {
+                    pImportDesc++;
+                    continue;
+                }
+                PIMAGE_THUNK_DATA pThunkIAT = (PIMAGE_THUNK_DATA)((LPBYTE)imageBase + iatRVA);
+
+                LPBYTE thunkEnd = (LPBYTE)imageBase + imageSize;
+
+                while ((LPBYTE)pThunkILT < thunkEnd && pThunkILT->u1.AddressOfData != 0) {
                     FARPROC funcAddress = NULL;
                     if (IMAGE_SNAP_BY_ORDINAL(pThunkILT->u1.Ordinal)) {
                         WORD ordinal = IMAGE_ORDINAL(pThunkILT->u1.Ordinal);
                         funcAddress = pGetProcAddress(hMod, (LPCSTR)ordinal);
                     }
                     else {
+                        if (pThunkILT->u1.AddressOfData >= imageSize) break;
                         PIMAGE_IMPORT_BY_NAME pImportByName = (PIMAGE_IMPORT_BY_NAME)((LPBYTE)imageBase + pThunkILT->u1.AddressOfData);
+                        if ((LPBYTE)pImportByName->Name >= (LPBYTE)imageBase + imageSize) break;
                         char* funcName = (char*)pImportByName->Name;
                         funcAddress = pGetProcAddress(hMod, funcName);
                     }
@@ -84,6 +97,7 @@ namespace ManualMapInjector {
 #else
                     pThunkIAT->u1.Function = (DWORD)funcAddress;
 #endif
+
                     pThunkILT++;
                     pThunkIAT++;
                 }
@@ -93,8 +107,18 @@ namespace ManualMapInjector {
 
         DWORD entryPointRVA = pNtHeaders->OptionalHeader.AddressOfEntryPoint;
         if (entryPointRVA != 0) {
+            if (entryPointRVA >= imageSize) return (DWORD)-7;
+
             DllEntryProc dllMain = (DllEntryProc)((LPBYTE)imageBase + entryPointRVA);
-            BOOL success = dllMain((HINSTANCE)imageBase, DLL_PROCESS_ATTACH, NULL);
+            BOOL success = FALSE;
+
+            __try {
+                success = dllMain((HINSTANCE)imageBase, DLL_PROCESS_ATTACH, NULL);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                return (DWORD)-8;
+            }
+
             return (DWORD)success;
         }
         return (DWORD)1;

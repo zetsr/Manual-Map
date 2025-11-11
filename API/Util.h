@@ -1,20 +1,34 @@
+#pragma once
 #ifndef MM_UTIL_H
 #define MM_UTIL_H
-
 #include "Config.h"
+#include "NT.h"  // 引入 NT API
 #include <tlhelp32.h>
 #include <memory>
 #include <string>
 #include <vector>
 #include <cstdint>
 #include <cstdio>
+#include <windows.h>
+#include <thread>
+#include <chrono>
 
 namespace ManualMapInjector {
 
     struct HandleDeleter {
-        using pointer = HANDLE;
-        void operator()(HANDLE handle) const {
-            if (handle != NULL && handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+        void operator()(void* ptr) const {
+            if (ptr) {
+                HANDLE handle = static_cast<HANDLE>(ptr);
+                if (handle != NULL && handle != INVALID_HANDLE_VALUE) {
+                    LoadNtDll();
+                    if (NtClose) {
+                        NtClose(handle);
+                    }
+                    else {
+                        CloseHandle(handle);
+                    }
+                }
+            }
         }
     };
     using unique_handle = std::unique_ptr<void, HandleDeleter>;
@@ -22,8 +36,17 @@ namespace ManualMapInjector {
     struct VirtualFreeDeleter {
         HANDLE hProcess;
         VirtualFreeDeleter(HANDLE process) : hProcess(process) {}
-        void operator()(LPVOID memory) const {
-            if (memory) VirtualFreeEx(hProcess, memory, 0, MEM_RELEASE);
+        void operator()(void* memory) const {
+            if (memory) {
+                LoadNtDll();
+                if (NtFreeVirtualMemory) {
+                    SIZE_T size = 0;
+                    NtFreeVirtualMemory(hProcess, &memory, &size, MEM_RELEASE);
+                }
+                else {
+                    VirtualFreeEx(hProcess, memory, 0, MEM_RELEASE);
+                }
+            }
         }
     };
     using unique_virtual_mem = std::unique_ptr<void, VirtualFreeDeleter>;
@@ -38,20 +61,38 @@ namespace ManualMapInjector {
     }
 
     inline HMODULE GetModuleBaseInTargetProcess(HANDLE hProcess, const std::wstring& moduleName) {
-        HANDLE rawSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetProcessId(hProcess));
-        if (rawSnapshot == INVALID_HANDLE_VALUE) {
-            return NULL;
-        }
-        unique_handle snapshotHandle(rawSnapshot);
+        const int maxRetries = 5;
+        const int retryDelayMs = 1000;
 
-        MODULEENTRY32 me32 = { sizeof(MODULEENTRY32) };
-        if (Module32First(snapshotHandle.get(), &me32)) {
-            do {
-                if (_wcsicmp(me32.szModule, moduleName.c_str()) == 0) {
-                    return (HMODULE)me32.modBaseAddr;
+        for (int retry = 0; retry < maxRetries; ++retry) {
+            HANDLE rawSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetProcessId(hProcess));
+            if (rawSnapshot == INVALID_HANDLE_VALUE) {
+                if (retry < maxRetries - 1) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(retryDelayMs));
+                    continue;
                 }
-            } while (Module32Next(snapshotHandle.get(), &me32));
+                wprintf(L"警告：CreateToolhelp32Snapshot 失败，无法获取模块列表。错误代码：%lu\n", GetLastError());
+                return NULL;
+            }
+            unique_handle snapshotHandle(static_cast<void*>(rawSnapshot), HandleDeleter());
+            MODULEENTRY32 me32 = { sizeof(MODULEENTRY32) };
+            HANDLE snapshotH = static_cast<HANDLE>(snapshotHandle.get());
+            if (Module32First(snapshotH, &me32)) {
+                do {
+                    if (_wcsicmp(me32.szModule, moduleName.c_str()) == 0) {
+                        if (retry > 0) {
+                            wprintf(L"提示：模块 '%s' 在重试 %d 次后找到。\n", moduleName.c_str(), retry);
+                        }
+                        return (HMODULE)me32.modBaseAddr;
+                    }
+                } while (Module32Next(snapshotH, &me32));
+            }
+            if (retry < maxRetries - 1) {
+                wprintf(L"提示：模块 '%s' 未找到，重试 %d/%d...\n", moduleName.c_str(), retry + 1, maxRetries);
+                std::this_thread::sleep_for(std::chrono::milliseconds(retryDelayMs));
+            }
         }
+        wprintf(L"错误：模块 '%s' 在 %d 次重试后仍未找到。进程可能不稳定或架构不匹配。\n", moduleName.c_str(), maxRetries);
         return NULL;
     }
 
@@ -61,11 +102,9 @@ namespace ManualMapInjector {
             wprintf(L"错误：模块 '%s' 在目标进程中未找到。\n", moduleName.c_str());
             return NULL;
         }
-
         std::string moduleNameUtf8 = WstringToUtf8(moduleName);
         HMODULE hInjectorMod = GetModuleHandleA(moduleNameUtf8.c_str());
         bool loadedByUs = false;
-
         if (!hInjectorMod) {
             hInjectorMod = LoadLibraryA(moduleNameUtf8.c_str());
             if (!hInjectorMod) {
@@ -74,7 +113,6 @@ namespace ManualMapInjector {
             }
             loadedByUs = true;
         }
-
         FARPROC injectorFuncAddr = GetProcAddress(hInjectorMod, procName.c_str());
         if (!injectorFuncAddr) {
             wprintf(L"错误：GetProcAddress 失败，函数 '%hs' 在模块 '%s' 中。错误代码：%lu\n",
@@ -82,20 +120,16 @@ namespace ManualMapInjector {
             if (loadedByUs) FreeLibrary(hInjectorMod);
             return NULL;
         }
-
         TULONGLONG funcOffset = (TULONGLONG)injectorFuncAddr - (TULONGLONG)hInjectorMod;
         FARPROC result = (FARPROC)((LPBYTE)hTargetMod + funcOffset);
-
         if (loadedByUs) {
             FreeLibrary(hInjectorMod);
         }
-
         return result;
     }
 
     inline DWORD RvaToFileOffset(PIMAGE_NT_HEADERS_CURRENT pNtHeaders, DWORD rva, size_t fileSize) {
         if (rva < pNtHeaders->OptionalHeader.SizeOfHeaders) return rva;
-
         PIMAGE_SECTION_HEADER pSectionHeader = IMAGE_FIRST_SECTION(pNtHeaders);
         for (WORD i = 0; i < pNtHeaders->FileHeader.NumberOfSections; ++i, ++pSectionHeader) {
             if (rva >= pSectionHeader->VirtualAddress && rva < pSectionHeader->VirtualAddress + pSectionHeader->Misc.VirtualSize) {
@@ -136,7 +170,5 @@ namespace ManualMapInjector {
         }
     }
 #pragma optimize("", on)
-
 }
-
 #endif

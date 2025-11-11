@@ -43,6 +43,9 @@
     <ClInclude Include="API\ManualMapInjector.h">
       <Filter>API</Filter>
     </ClInclude>
+    <ClInclude Include="API\NT.h">
+      <Filter>API</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Injector\Main.cpp">

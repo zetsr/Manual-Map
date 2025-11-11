@@ -71,6 +71,14 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <TargetName>Manual-Map_x86</TargetName>
+    <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(ShortProjectName)\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <TargetName>Manual-Map_x64</TargetName>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -139,6 +147,7 @@
     <ClInclude Include="API\Config.h" />
     <ClInclude Include="API\ManualMap.h" />
     <ClInclude Include="API\ManualMapInjector.h" />
+    <ClInclude Include="API\NT.h" />
     <ClInclude Include="API\Shellcode.h" />
     <ClInclude Include="API\Util.h" />
     <ClInclude Include="Injector\Common.h" />

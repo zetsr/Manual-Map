@@ -27,6 +27,8 @@ int wmain(int argc, wchar_t* argv[]) {
     _setmode(_fileno(stderr), _O_U16TEXT);
     _setmode(_fileno(stdin), _O_U16TEXT);
 
+    SetConsoleTitleW(L"github.com/zetsr");
+
     SetConsoleCursorVisibility(false);
     ClearConsole();
     DisplayBanner();

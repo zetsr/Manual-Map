@@ -157,6 +157,10 @@ namespace ManualMapInjector {
                 }
                 PIMAGE_BASE_RELOCATION pRelocBlock = (PIMAGE_BASE_RELOCATION)(dllBuffer + relocOffset);
                 LPBYTE relocTableEnd = (LPBYTE)pRelocBlock + relocDir.Size;
+
+                // 全局重定位计数器（以十进制计数，方括号中显示十进制；地址/偏移以十六进制显示）
+                unsigned long long relocationCounter = 0;
+
                 while ((LPBYTE)pRelocBlock < relocTableEnd && pRelocBlock->SizeOfBlock > 0) {
                     if ((LPBYTE)pRelocBlock + pRelocBlock->SizeOfBlock > relocTableEnd) {
                         wprintf(L"错误：无效的重定位块大小。\n");
@@ -172,16 +176,36 @@ namespace ManualMapInjector {
                             void* patchAddrTarget = (LPBYTE)allocatedBase + pRelocBlock->VirtualAddress + offset;
                             // 修复：检查 patchAddrTarget 在图像范围内
                             if ((LPBYTE)patchAddrTarget < (LPBYTE)allocatedBase || (LPBYTE)patchAddrTarget >= (LPBYTE)allocatedBase + pNtHeaders->OptionalHeader.SizeOfImage) {
-                                wprintf(L"警告：重定位地址越界，跳过。\n");
+                                // 仍然只输出一行日志（表明跳过），原/新地址用 -- 占位
+                                relocationCounter++;
+                                wprintf(
+                                    L"[github.com/zetsr] [%llu] Relocation=0x%llX | Address=-- → -- | Offset=0x%llX | RVA=0x%lX\n",
+                                    (unsigned long long)relocationCounter,
+                                    (unsigned long long)(uintptr_t)patchAddrTarget,
+                                    (unsigned long long)relocationCounter,
+                                    (unsigned long)pRelocBlock->VirtualAddress
+                                );
                                 continue;
                             }
+
+                            // 增加计数（以十进制显示在方括号里）
+                            relocationCounter++;
+
                             TULONGLONG originalAddr;
                             SIZE_T bytesRead;
                             status = NtReadVirtualMemory ? NtReadVirtualMemory(processH, patchAddrTarget, &originalAddr, sizeof(TULONGLONG), &bytesRead) : STATUS_UNSUCCESSFUL;
                             if (!NT_SUCCESS(status) || bytesRead != sizeof(TULONGLONG)) {
-                                wprintf(L"警告：NtReadVirtualMemory 在 " TULONGLONG_FORMAT " 失败。\n", (TULONGLONG)patchAddrTarget);
+                                // 只输出一行日志，包含失败信息（原/新地址用 -- 占位）
+                                wprintf(
+                                    L"[github.com/zetsr] [%llu] Relocation=0x%llX | Address=-- → -- | Offset=0x%llX | RVA=0x%lX | NOTE=ReadFail\n",
+                                    (unsigned long long)relocationCounter,
+                                    (unsigned long long)(uintptr_t)patchAddrTarget,
+                                    (unsigned long long)relocationCounter,
+                                    (unsigned long)pRelocBlock->VirtualAddress
+                                );
                                 continue;
                             }
+
                             TULONGLONG newAddr = originalAddr + delta;
                             // 修复：x86 模 4GB 防止溢出
 #if !defined(_WIN64)
@@ -190,10 +214,27 @@ namespace ManualMapInjector {
                             SIZE_T bytesWritten;
                             status = NtWriteVirtualMemory ? NtWriteVirtualMemory(processH, patchAddrTarget, &newAddr, sizeof(TULONGLONG), &bytesWritten) : STATUS_UNSUCCESSFUL;
                             if (!NT_SUCCESS(status) || bytesWritten != sizeof(TULONGLONG)) {
-                                wprintf(L"警告：NtWriteVirtualMemory（重定位）在 " TULONGLONG_FORMAT " 失败。原: " TULONGLONG_FORMAT " 新: " TULONGLONG_FORMAT "\n", (TULONGLONG)patchAddrTarget, originalAddr, newAddr);
+                                // 写入失败也只输出一行日志，包含原始与期望新地址以便排查
+                                wprintf(
+                                    L"[github.com/zetsr] [%llu] Relocation=0x%llX | Address=0x%llX → 0x%llX | Offset=0x%llX | RVA=0x%lX | NOTE=WriteFail\n",
+                                    (unsigned long long)relocationCounter,
+                                    (unsigned long long)(uintptr_t)patchAddrTarget,
+                                    (unsigned long long)originalAddr, (unsigned long long)newAddr,
+                                    (unsigned long long)relocationCounter,
+                                    (unsigned long)pRelocBlock->VirtualAddress
+                                );
                                 continue;
                             }
-                            wprintf(L"重定位成功：地址 " TULONGLONG_FORMAT " 原 " TULONGLONG_FORMAT " 新 " TULONGLONG_FORMAT "\n", (TULONGLONG)patchAddrTarget, originalAddr, newAddr);
+
+                            // 成功：只输出一行格式化信息（方括号内计数为十进制；地址与偏移等按十六进制显示）
+                            wprintf(
+                                L"[github.com/zetsr] [%llu] Relocation=0x%llX | Address=0x%llX → 0x%llX | Offset=0x%llX | RVA=0x%lX\n",
+                                (unsigned long long)relocationCounter,
+                                (unsigned long long)(uintptr_t)patchAddrTarget,
+                                (unsigned long long)originalAddr, (unsigned long long)newAddr,
+                                (unsigned long long)relocationCounter,
+                                (unsigned long)pRelocBlock->VirtualAddress
+                            );
                         }
                     }
                     pRelocBlock = (PIMAGE_BASE_RELOCATION)((LPBYTE)pRelocBlock + pRelocBlock->SizeOfBlock);
@@ -204,6 +245,7 @@ namespace ManualMapInjector {
         else {
             wprintf(L"无需重定位。\n");
         }
+
 
         FARPROC pLoadLibraryA_Remote = FindRemoteProcAddress(processH, L"kernel32.dll", "LoadLibraryA");
         FARPROC pGetProcAddress_Remote = FindRemoteProcAddress(processH, L"kernel32.dll", "GetProcAddress");

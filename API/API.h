@@ -12,6 +12,7 @@
 #include "Config.h"
 #include "Util.h"
 #include "Shellcode.h"
+#include "ManualMap.h"
 
 namespace ManualMapInjector {
 

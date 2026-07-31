@@ -146,7 +146,6 @@
     <ClInclude Include="API\API.h" />
     <ClInclude Include="API\Config.h" />
     <ClInclude Include="API\ManualMap.h" />
-    <ClInclude Include="API\ManualMapInjector.h" />
     <ClInclude Include="API\NT.h" />
     <ClInclude Include="API\Shellcode.h" />
     <ClInclude Include="API\Util.h" />
